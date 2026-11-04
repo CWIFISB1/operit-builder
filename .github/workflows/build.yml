@@ -247,10 +247,29 @@ jobs:
           npm run build:examples:github
           python3 tools/example_packages/sync_example_packages.py --no-hot-reload
 
-      - name: 配置 SDK 路径
+      - name: 配置 SDK 路径与签名
         shell: bash
         working-directory: src
-        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+        run: |
+          set -euo pipefail
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          # nightly/release 需要轮换签名配置，没有正式 key 就用 nightly 专用 key
+          KS="$GITHUB_WORKSPACE/keystore/operit-nightly.jks"
+          {
+            echo "RELEASE_STORE_FILE=$KS"
+            echo "RELEASE_STORE_PASSWORD=operit2026"
+            echo "RELEASE_KEY_ALIAS=operit"
+            echo "RELEASE_KEY_PASSWORD=operit2026"
+            echo "APK_ROTATION_NEW_STORE_FILE=$KS"
+            echo "APK_ROTATION_NEW_STORE_PASSWORD=operit2026"
+            echo "APK_ROTATION_NEW_KEY_ALIAS=operit"
+            echo "APK_ROTATION_NEW_KEY_PASSWORD=operit2026"
+          } >> local.properties
+          mkdir -p "$GITHUB_WORKSPACE/keystore"
+          curl -fsSL --retry 3 -m 120 -o "$KS" \
+            "https://github.com/CWIFISB1/operit-build/releases/download/prebuilt-deps/operit-nightly.jks"
+          test -s "$KS"
+          echo '[keystore OK]' "$(stat -c%s "$KS")"
 
       # ---------- 编译 ----------
       - name: Gradle 构建
