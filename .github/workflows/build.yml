@@ -1,0 +1,312 @@
+name: Build APK
+
+# 构建器仓库：源码不入库，构建时 clone；产物走 Release，不走 artifact（GitHub artifact 配额会爆）
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 源码仓库（owner/name）
+        required: true
+        default: CWIFISB1/Operit
+        type: string
+      ref:
+        description: 分支或 commit
+        required: true
+        default: main
+        type: string
+      gradle_task:
+        description: Gradle 任务
+        required: true
+        default: assembleDebug
+        type: choice
+        options:
+          - assembleDebug
+          - :app:assembleNightly
+          - :app:assembleClone
+          - :app:bundleRelease
+      publish_release:
+        description: 构建成功后发布到 Release（推荐开启）
+        required: true
+        default: true
+        type: boolean
+      release_tag:
+        description: Release 标签（留空自动用 run_number）
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: build-${{ github.event.inputs.repo }}-${{ github.event.inputs.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  JAVA_VERSION: '21'
+  NODE_VERSION: '22'
+  ANDROID_NDK_VERSION: '25.1.8937393'
+  ANDROID_CMAKE_VERSION: '3.22.1'
+  ANDROID_API_LEVEL: '26'
+  RUST_VERSION: '1.88.0'
+  MANUAL_DEPS_DIR: manual-deps
+
+jobs:
+  build:
+    name: Build Android artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: 释放磁盘
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/emulator \
+            /usr/local/lib/android/sdk/system-images /opt/ghc /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      # ---------- 取源码 ----------
+      - name: 签出源码
+        shell: bash
+        run: |
+          set -euo pipefail
+          # submodule（terminal）用 SSH 地址，重写成 HTTPS + token 才能拉
+          git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "git@github.com:"
+          git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+          git clone --branch "${{ inputs.ref }}" "https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ inputs.repo }}.git" src
+          cd src
+          git log --oneline -1
+          echo "SRC_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "SRC_SHORT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: 初始化 submodule
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          git submodule sync || true
+          for sm in $(git config -f .gitmodules --get-regexp path | awk '{print $2}'); do
+            if git submodule update --init --recursive --depth 1 "$sm"; then
+              echo "OK $sm"
+            else
+              echo "SKIP $sm（可选子模块拉取失败）"
+            fi
+          done
+          ls terminal/ | head -5
+
+      - name: 设置 Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: 设置 JDK
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 设置 Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: ''
+
+      - name: 安装 SDK / NDK / CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-36" \
+            "build-tools;34.0.0" \
+            "build-tools;35.0.0" \
+            "ndk;$ANDROID_NDK_VERSION" \
+            "cmake;$ANDROID_CMAKE_VERSION"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          df -h /
+
+      - name: 缓存 CMake 源码
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: src/**/.cxx/operit_deps/*-src
+          key: cmake-src-${{ runner.os }}-arm64-ndk-${{ env.ANDROID_NDK_VERSION }}-${{ hashFiles('src/cmake/**', 'src/**/CMakeLists.txt') }}
+
+      - name: 缓存 Android 依赖
+        id: cache-deps
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: manual-deps
+          key: deps-${{ runner.os }}-${{ hashFiles('src/ci/script/download_android_dependencies.sh', 'src/ci/script/prepare_android_dependencies.py') }}
+          restore-keys: deps-${{ runner.os }}-
+
+      # ---------- 依赖下载：优先走 Release 镜像，Google Drive 仅兜底 ----------
+      - name: 下载 Android 依赖
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          MIRROR="https://github.com/CWIFISB1/operit-build/releases/download/prebuilt-deps"
+          mkdir -p manual-deps
+          fetch() {
+            local name="$1" id="$2"
+            echo "[deps] $name"
+            if curl -fsSL --retry 3 --retry-delay 5 -m 600 -o "manual-deps/$name" "$MIRROR/$name"; then
+              if [ -s "manual-deps/$name" ]; then
+                echo "[deps] $name 从镜像下载完成 $(stat -c%s manual-deps/$name) 字节"
+                return 0
+              fi
+            fi
+            echo "[deps] 镜像失败，走 Google Drive 兜底"
+            python3 -m venv .gdown-venv
+            . .gdown-venv/bin/activate
+            pip install -q gdown==6.1.0
+            gdown "https://drive.google.com/uc?id=$id" -O "manual-deps/$name"
+            test -s "manual-deps/$name"
+          }
+          fetch libs.zip 1Va1os7PRpCF3xtTwfx5kO11D7eIAvARG
+          fetch subpack.zip 1SQs_dVPD6ldvwteqoUVjvBLjTWvr5Fpv
+          fetch jniLibs.zip 1-W4fjjUwoShnB8Rh9RT5Gl8sHiGyQUaM
+          ls -lh manual-deps/
+
+      - name: 解压依赖
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          python3 ci/script/prepare_android_dependencies.py \
+            --profile full \
+            --archives "$GITHUB_WORKSPACE/manual-deps" \
+            --repository "$GITHUB_WORKSPACE/src"
+          # ffmpeg-kit AAR 被 .gitignore 排除，从镜像取
+          MIRROR="https://github.com/CWIFISB1/operit-build/releases/download/prebuilt-deps"
+          if [ ! -s app/libs/ffmpeg-kit-local.aar ]; then
+            mkdir -p app/libs
+            curl -fsSL --retry 3 -m 600 -o app/libs/ffmpeg-kit-local.aar "$MIRROR/ffmpeg-kit-local.aar"
+          fi
+          test -s app/libs/ffmpeg-kit-local.aar
+          ls -lh app/libs/
+
+      # ---------- 原生依赖 ----------
+      - name: 缓存 ripgrep
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/tools/native_ripgrep/target
+          key: ripgrep-${{ runner.os }}-ndk-${{ env.ANDROID_NDK_VERSION }}-rust-${{ env.RUST_VERSION }}-${{ hashFiles('src/tools/native_ripgrep/Cargo.toml', 'src/tools/native_ripgrep/**/*.rs') }}
+
+      - name: 编译 ripgrep
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API_LEVEL}-clang"
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup target add --toolchain "$RUST_VERSION" aarch64-linux-android
+          cargo "+$RUST_VERSION" build \
+            --manifest-path tools/native_ripgrep/Cargo.toml \
+            --release --target aarch64-linux-android --locked
+          install -Dm755 \
+            tools/native_ripgrep/target/aarch64-linux-android/release/liboperit_ripgrep.so \
+            app/src/main/jniLibs/arm64-v8a/liboperit_ripgrep.so
+          test -s app/src/main/jniLibs/arm64-v8a/liboperit_ripgrep.so
+
+      # ---------- 前端资产 ----------
+      - name: 安装 JS 依赖
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          npm install -g pnpm@10.34.5
+          npm ci --no-audit --no-fund
+          npm --prefix web-chat ci --no-audit --no-fund
+
+      - name: 构建 WebChat
+        working-directory: src
+        run: npm run build:webchat
+
+      - name: 构建内置 ToolPkg
+        working-directory: src
+        run: |
+          npm run build:examples:github
+          python3 tools/example_packages/sync_example_packages.py --no-hot-reload
+
+      - name: 配置 SDK 路径
+        shell: bash
+        working-directory: src
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      # ---------- 编译 ----------
+      - name: Gradle 构建
+        shell: bash
+        working-directory: src
+        env:
+          DISPATCH_TASK: ${{ inputs.gradle_task }}
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew "$DISPATCH_TASK" --stacktrace --no-daemon --console=plain
+          echo '[产物]'
+          find app/build/outputs -name '*.apk' -o -name '*.aab' | while read f; do ls -lh "$f"; done
+
+      # ---------- 发布：走 Release，避开 artifact 配额 ----------
+      - name: 发布到 Release
+        if: success() && inputs.publish_release
+        shell: bash
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          TAG_INPUT: ${{ inputs.release_tag }}
+          SRC_REPO: ${{ inputs.repo }}
+        run: |
+          set -euo pipefail
+          TAG="${TAG_INPUT:-build-${{ github.run_number }}}"
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          NOTES=$(printf '源码: %s @ %s\n任务: %s\n构建时间: %s\n' "$SRC_REPO" "$SRC_SHA" "${{ inputs.gradle_task }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+          gh release create "$TAG" --repo "${{ github.repository }}" --title "Operit $SRC_SHORT ($TAG)" --notes "$NOTES" --latest=true || true
+          found=0
+          while IFS= read -r f; do
+            echo "上传 $f"
+            gh release upload "$TAG" "$f" --repo "${{ github.repository }}" --clobber
+            found=1
+          done < <(find app/build/outputs -name '*.apk' -o -name '*.aab')
+          [ "$found" = "1" ] || { echo '没有找到 APK/AAB'; exit 1; }
+          echo "[发布完成] https://github.com/${{ github.repository }}/releases/tag/$TAG"
+
+      - name: 失败时上传构建报告
+        if: failure()
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rpt
+          cp -r app/build/reports /tmp/rpt/ 2>/dev/null || true
+          cp -r build/reports /tmp/rpt/build-reports 2>/dev/null || true
+          TAG="fail-${{ github.run_number }}"
+          gh release create "$TAG" --repo "${{ github.repository }}" \
+            --title "构建失败 $SRC_SHORT" \
+            --notes "见附件 build-reports.tar.gz" || true
+          tar czf /tmp/build-reports.tar.gz -C /tmp/rpt . 2>/dev/null || true
+          gh release upload "$TAG" /tmp/build-reports.tar.gz --repo "${{ github.repository }}" --clobber || true
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+
+      - name: 汇总
+        if: always()
+        run: |
+          echo "### 构建结果" >> $GITHUB_STEP_SUMMARY
+          echo "- 源码: ${{ inputs.repo }} @ $SRC_SHA" >> $GITHUB_STEP_SUMMARY
+          echo "- 任务: ${{ inputs.gradle_task }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 状态: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Release: https://github.com/${{ github.repository }}/releases" >> $GITHUB_STEP_SUMMARY
