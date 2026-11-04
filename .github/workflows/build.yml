@@ -76,8 +76,18 @@ jobs:
           # submodule（terminal）用 SSH 地址，重写成 HTTPS + token 才能拉
           git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "git@github.com:"
           git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
-          git clone --branch "${{ inputs.ref }}" "https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ inputs.repo }}.git" src
+          REF="${{ inputs.ref }}"
+          git init -q src
           cd src
+          git remote add origin "https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ inputs.repo }}.git"
+          # ref 可能是分支名，也可能是 commit SHA：两种情况都能取到
+          if git fetch --depth 1 origin "$REF" 2>/dev/null; then
+            git checkout -q FETCH_HEAD
+          else
+            echo "[ref] 直接 fetch $REF 失败，改拉分支后 checkout"
+            git fetch --depth 50 origin
+            git checkout -q "$REF"
+          fi
           git log --oneline -1
           echo "SRC_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
           echo "SRC_SHORT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
