@@ -15,15 +15,10 @@ on:
         default: main
         type: string
       gradle_task:
-        description: Gradle 任务
+        description: 'Gradle 任务，例如 assembleDebug / :app:assembleNightly / :app:bundleRelease'
         required: true
         default: assembleDebug
-        type: choice
-        options:
-          - assembleDebug
-          - :app:assembleNightly
-          - :app:assembleClone
-          - :app:bundleRelease
+        type: string
       publish_release:
         description: 构建成功后发布到 Release（推荐开启）
         required: true
