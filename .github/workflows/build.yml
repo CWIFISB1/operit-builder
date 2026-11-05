@@ -302,7 +302,16 @@ jobs:
           TAG="${TAG_INPUT:-build-${{ github.run_number }}}"
           echo "TAG=$TAG" >> $GITHUB_ENV
           NOTES=$(printf '源码: %s @ %s\n任务: %s\n构建时间: %s\n' "$SRC_REPO" "$SRC_SHA" "${{ inputs.gradle_task }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
-          gh release create "$TAG" --repo "${{ github.repository }}" --title "Operit $SRC_SHORT ($TAG)" --notes "$NOTES" --latest=true || true
+          # 关键：Release 可能已存在（同一个 tag 反复发布）。
+          # 旧写法 `create ... || true` 在 Release 已存在时直接失败并被吞掉，
+          # 导致标题与 NOTES 永远停在第一次创建的值，只有 APK 文件被 --clobber 换新，
+          # 外观上就成了「包没更新」。这里改成 create 失败则 edit，元信息每次刷新。
+          if ! gh release create "$TAG" --repo "${{ github.repository }}" \
+                --title "Operit $SRC_SHORT ($TAG)" --notes "$NOTES" --latest=true; then
+            echo "[release] $TAG 已存在，改为更新标题与说明"
+            gh release edit "$TAG" --repo "${{ github.repository }}" \
+                --title "Operit $SRC_SHORT ($TAG)" --notes "$NOTES" --latest=true
+          fi
           found=0
           while IFS= read -r f; do
             echo "上传 $f"
