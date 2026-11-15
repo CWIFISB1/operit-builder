@@ -17,7 +17,9 @@ on:
       gradle_task:
         description: 'Gradle 任务，例如 assembleDebug / :app:assembleNightly / :app:bundleRelease'
         required: true
-        default: assembleDebug
+        # 默认一次出两个包：当前版（debug）+ 云机版（yunji，包名 com.yunjing.assistant）。
+        # 两个包共用一次 run，避免 concurrency 分组按 repo+ref 互相取消。
+        default: assembleDebug assembleYunji
         type: string
       publish_release:
         description: 构建成功后发布到 Release（推荐开启）
@@ -284,7 +286,11 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./gradlew
-          ./gradlew "$DISPATCH_TASK" --stacktrace --no-daemon --console=plain
+          # 允许 gradle_task 传多个任务（空格分隔），一次构建出多个包。
+          # 旧写法用引号包住整个变量，传 "assembleDebug assembleYunji" 会被
+          # 当成单个任务名，报 Task not found。这里按空白分词后展开。
+          read -ra TASKS <<< "$DISPATCH_TASK"
+          ./gradlew "${TASKS[@]}" --stacktrace --no-daemon --console=plain
           echo '[产物]'
           find app/build/outputs -name '*.apk' -o -name '*.aab' | while read f; do ls -lh "$f"; done
 
