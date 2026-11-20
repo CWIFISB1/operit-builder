@@ -12,7 +12,7 @@ on:
       ref:
         description: 分支或 commit
         required: true
-        default: main
+        default: allpr
         type: string
       gradle_task:
         description: 'Gradle 任务，例如 assembleDebug / :app:assembleNightly / :app:bundleRelease'
