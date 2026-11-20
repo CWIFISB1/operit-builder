@@ -155,6 +155,22 @@ jobs:
           key: deps-${{ runner.os }}-${{ hashFiles('src/ci/script/download_android_dependencies.sh', 'src/ci/script/prepare_android_dependencies.py') }}
           restore-keys: deps-${{ runner.os }}-
 
+      # Gradle 构建缓存。实测日志显示 assembleDebug + assembleYunji 一次跑约 47 分钟，
+      # GitHub 托管 runner 常在 44~47 分钟处被回收（注解 The operation was canceled /
+      # runner has received a shutdown signal），连续四次全部断在 dexBuilderYunji 一带。
+      # 把 ~/.gradle 的依赖缓存与构建输出缓存持久化后，第二次起增量编译仅十几分钟，
+      # 稳定落在安全窗口内。key 只跟构建脚本与版本目录绑定，源码小改动仍能命中。
+      - name: 缓存 Gradle 构建输出
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/caches/build-cache-1
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('src/**/*.gradle*', 'src/gradle.properties', 'src/gradle/wrapper/gradle-wrapper.properties', 'src/gradle/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
       # ---------- 依赖下载：优先走 Release 镜像，Google Drive 仅兜底 ----------
       - name: 下载 Android 依赖
         if: steps.cache-deps.outputs.cache-hit != 'true'
